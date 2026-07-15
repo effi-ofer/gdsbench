@@ -4,6 +4,7 @@
 import argparse
 import ctypes
 import os
+import threading
 import time
 
 import torch
@@ -236,8 +237,16 @@ def run_benchmark(args, backend):
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    for ctx in write_ctxs:
-        backend.write(ctx, buf_ptr, aligned_size)
+    if len(write_ctxs) > 1:
+        threads = [threading.Thread(target=backend.write, args=(ctx, buf_ptr, aligned_size))
+                   for ctx in write_ctxs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    else:
+        for ctx in write_ctxs:
+            backend.write(ctx, buf_ptr, aligned_size)
     backend.wait(write_ctxs)
 
     t1 = time.perf_counter()
@@ -262,8 +271,16 @@ def run_benchmark(args, backend):
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    for ctx in read_ctxs:
-        backend.read(ctx, read_ptr, aligned_size)
+    if len(read_ctxs) > 1:
+        threads = [threading.Thread(target=backend.read, args=(ctx, read_ptr, aligned_size))
+                   for ctx in read_ctxs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    else:
+        for ctx in read_ctxs:
+            backend.read(ctx, read_ptr, aligned_size)
     backend.wait(read_ctxs)
 
     t1 = time.perf_counter()
