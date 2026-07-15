@@ -51,6 +51,12 @@ libcufile.cuFileBufRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes
 libcufile.cuFileBufDeregister.restype = CUfileError_t
 libcufile.cuFileBufDeregister.argtypes = [ctypes.c_void_p]
 
+libcufile.cuFileStreamRegister.restype = CUfileError_t
+libcufile.cuFileStreamRegister.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+
+libcufile.cuFileStreamDeregister.restype = CUfileError_t
+libcufile.cuFileStreamDeregister.argtypes = [ctypes.c_void_p]
+
 libcufile.cuFileWriteAsync.restype = CUfileError_t
 libcufile.cuFileWriteAsync.argtypes = [
     CUfileHandle_t,                      # handle
@@ -115,47 +121,51 @@ def run_async(args):
     err = libcufile.cuFileDriverOpen()
     assert err.err == CU_FILE_SUCCESS, f"cuFileDriverOpen failed: {err.err}"
 
-    stream = torch.cuda.Stream()
-
     write_buf = torch.full((aligned_size,), 0xAB, dtype=torch.uint8, device="cuda")
     buf_ptr = write_buf.data_ptr()
     err = libcufile.cuFileBufRegister(buf_ptr, aligned_size, 0)
     assert err.err == CU_FILE_SUCCESS, f"cuFileBufRegister write failed: {err.err}"
 
-    size_val = ctypes.c_size_t(aligned_size)
-    buf_offset = ctypes.c_ssize_t(0)
-    file_offset = ctypes.c_ssize_t(0)
-    bytes_done = ctypes.c_ssize_t(0)
-
-    # --- Writes (each to a separate file) ---
+    # --- Writes (each to a separate file, each with its own stream) ---
     write_files = [os.path.join(args.dir, f"gds_bench_{i}.bin") for i in range(args.writes)]
 
     write_fds = []
     write_handles = []
+    write_streams = []
     for filepath in write_files:
         fd = os.open(filepath, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
         handle = register_handle(fd)
+        s = torch.cuda.Stream()
+        err = libcufile.cuFileStreamRegister(s.cuda_stream, 0)
+        assert err.err == CU_FILE_SUCCESS, f"cuFileStreamRegister failed: {err.err}"
         write_fds.append(fd)
         write_handles.append(handle)
+        write_streams.append(s)
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     for i in range(args.writes):
+        size_val = ctypes.c_size_t(aligned_size)
+        buf_offset = ctypes.c_ssize_t(0)
+        file_offset = ctypes.c_ssize_t(0)
+        bytes_done = ctypes.c_ssize_t(0)
         err = libcufile.cuFileWriteAsync(
             write_handles[i], buf_ptr,
             ctypes.byref(size_val),
             ctypes.byref(file_offset),
             ctypes.byref(buf_offset),
             ctypes.byref(bytes_done),
-            stream.cuda_stream,
+            write_streams[i].cuda_stream,
         )
         assert err.err == CU_FILE_SUCCESS, f"cuFileWriteAsync #{i} failed: {err.err}"
 
-    stream.synchronize()
+    for s in write_streams:
+        s.synchronize()
     t1 = time.perf_counter()
 
     for i in range(args.writes):
+        libcufile.cuFileStreamDeregister(write_streams[i].cuda_stream)
         libcufile.cuFileHandleDeregister(write_handles[i])
         os.close(write_fds[i])
 
@@ -164,7 +174,7 @@ def run_async(args):
     throughput_gibs = (total_bytes / (1 << 30)) / (t1 - t0) if t1 > t0 else 0
     print(f"Writes complete: {args.writes} ops, {elapsed_ms:.2f} ms, {throughput_gibs:.3f} GiB/s")
 
-    # --- Reads (each from a separate file) ---
+    # --- Reads (each from a separate file, each with its own stream) ---
     read_buf = torch.zeros(aligned_size, dtype=torch.uint8, device="cuda")
     read_ptr = read_buf.data_ptr()
     err = libcufile.cuFileBufRegister(read_ptr, aligned_size, 0)
@@ -174,30 +184,41 @@ def run_async(args):
 
     read_fds = []
     read_handles = []
+    read_streams = []
     for filepath in read_files:
         fd = os.open(filepath, os.O_RDONLY | os.O_DIRECT)
         handle = register_handle(fd)
+        s = torch.cuda.Stream()
+        err = libcufile.cuFileStreamRegister(s.cuda_stream, 0)
+        assert err.err == CU_FILE_SUCCESS, f"cuFileStreamRegister failed: {err.err}"
         read_fds.append(fd)
         read_handles.append(handle)
+        read_streams.append(s)
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     for i in range(args.reads):
+        size_val = ctypes.c_size_t(aligned_size)
+        buf_offset = ctypes.c_ssize_t(0)
+        file_offset = ctypes.c_ssize_t(0)
+        bytes_done = ctypes.c_ssize_t(0)
         err = libcufile.cuFileReadAsync(
             read_handles[i], read_ptr,
             ctypes.byref(size_val),
             ctypes.byref(file_offset),
             ctypes.byref(buf_offset),
             ctypes.byref(bytes_done),
-            stream.cuda_stream,
+            read_streams[i].cuda_stream,
         )
         assert err.err == CU_FILE_SUCCESS, f"cuFileReadAsync #{i} failed: {err.err}"
 
-    stream.synchronize()
+    for s in read_streams:
+        s.synchronize()
     t1 = time.perf_counter()
 
     for i in range(args.reads):
+        libcufile.cuFileStreamDeregister(read_streams[i].cuda_stream)
         libcufile.cuFileHandleDeregister(read_handles[i])
         os.close(read_fds[i])
 
