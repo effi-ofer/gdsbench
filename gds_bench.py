@@ -79,23 +79,27 @@ libcufile.cuFileReadAsync.argtypes = [
     ctypes.c_void_p,                     # stream
 ]
 
-# --- Benchmark logic ---
+libcufile.cuFileRead.restype = ctypes.c_ssize_t
+libcufile.cuFileRead.argtypes = [
+    CUfileHandle_t,     # handle
+    ctypes.c_void_p,    # devPtr
+    ctypes.c_size_t,    # size
+    ctypes.c_long,      # file_offset (off_t)
+    ctypes.c_long,      # buf_offset (off_t)
+]
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="GDS API benchmark harness")
-    parser.add_argument("--api", default="async", choices=["async"],
-                        help="cuFile API to use (default: async)")
-    parser.add_argument("--tokens", type=int, default=1024,
-                        help="Number of tokens per I/O operation (1 token = 4 bytes)")
-    parser.add_argument("--writes", type=int, default=1,
-                        help="Number of write operations to issue")
-    parser.add_argument("--reads", type=int, default=1,
-                        help="Number of read operations to issue")
-    parser.add_argument("--dir", default=".",
-                        help="Directory for test files (must support O_DIRECT)")
-    return parser.parse_args()
+libcufile.cuFileWrite.restype = ctypes.c_ssize_t
+libcufile.cuFileWrite.argtypes = [
+    CUfileHandle_t,     # handle
+    ctypes.c_void_p,    # devPtr
+    ctypes.c_size_t,    # size
+    ctypes.c_long,      # file_offset (off_t)
+    ctypes.c_long,      # buf_offset (off_t)
+]
 
-def register_handle(fd):
+# --- Backends ---
+
+def _register_handle(fd):
     descr = CUfileDescr_t()
     descr.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD
     descr.handle.fd = fd
@@ -105,12 +109,109 @@ def register_handle(fd):
     assert err.err == CU_FILE_SUCCESS, f"cuFileHandleRegister failed: {err.err}"
     return handle.value
 
-def run_async(args):
-    token_size = 4
-    io_size = args.tokens * token_size
+
+class SyncBackend:
+    name = "cuFileRead / cuFileWrite (synchronous)"
+
+    def open_file(self, filepath, flags, mode=0o644):
+        fd = os.open(filepath, flags, mode)
+        handle = _register_handle(fd)
+        return {"fd": fd, "handle": handle}
+
+    def write(self, ctx, buf_ptr, size):
+        ret = libcufile.cuFileWrite(ctx["handle"], buf_ptr, size, 0, 0)
+        assert ret >= 0, f"cuFileWrite failed with error: {ret}"
+        assert ret == size, f"cuFileWrite short write: {ret}/{size}"
+
+    def read(self, ctx, buf_ptr, size):
+        ret = libcufile.cuFileRead(ctx["handle"], buf_ptr, size, 0, 0)
+        assert ret >= 0, f"cuFileRead failed with error: {ret}"
+        assert ret == size, f"cuFileRead short read: {ret}/{size}"
+
+    def wait(self, ctxs):
+        pass
+
+    def close(self, ctx):
+        libcufile.cuFileHandleDeregister(ctx["handle"])
+        os.close(ctx["fd"])
+
+
+class AsyncBackend:
+    name = "cuFileReadAsync / cuFileWriteAsync"
+
+    def open_file(self, filepath, flags, mode=0o644):
+        fd = os.open(filepath, flags, mode)
+        handle = _register_handle(fd)
+        stream = torch.cuda.Stream()
+        err = libcufile.cuFileStreamRegister(stream.cuda_stream, 0)
+        assert err.err == CU_FILE_SUCCESS, f"cuFileStreamRegister failed: {err.err}"
+        return {"fd": fd, "handle": handle, "stream": stream}
+
+    def write(self, ctx, buf_ptr, size):
+        size_val = ctypes.c_size_t(size)
+        file_offset = ctypes.c_ssize_t(0)
+        buf_offset = ctypes.c_ssize_t(0)
+        bytes_done = ctypes.c_ssize_t(0)
+        err = libcufile.cuFileWriteAsync(
+            ctx["handle"], buf_ptr,
+            ctypes.byref(size_val),
+            ctypes.byref(file_offset),
+            ctypes.byref(buf_offset),
+            ctypes.byref(bytes_done),
+            ctx["stream"].cuda_stream,
+        )
+        assert err.err == CU_FILE_SUCCESS, f"cuFileWriteAsync failed: {err.err}"
+
+    def read(self, ctx, buf_ptr, size):
+        size_val = ctypes.c_size_t(size)
+        file_offset = ctypes.c_ssize_t(0)
+        buf_offset = ctypes.c_ssize_t(0)
+        bytes_done = ctypes.c_ssize_t(0)
+        err = libcufile.cuFileReadAsync(
+            ctx["handle"], buf_ptr,
+            ctypes.byref(size_val),
+            ctypes.byref(file_offset),
+            ctypes.byref(buf_offset),
+            ctypes.byref(bytes_done),
+            ctx["stream"].cuda_stream,
+        )
+        assert err.err == CU_FILE_SUCCESS, f"cuFileReadAsync failed: {err.err}"
+
+    def wait(self, ctxs):
+        for ctx in ctxs:
+            ctx["stream"].synchronize()
+
+    def close(self, ctx):
+        libcufile.cuFileStreamDeregister(ctx["stream"].cuda_stream)
+        libcufile.cuFileHandleDeregister(ctx["handle"])
+        os.close(ctx["fd"])
+
+
+BACKENDS = {"async": AsyncBackend, "cufile": SyncBackend}
+
+# --- Benchmark harness ---
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="GDS API benchmark harness")
+    parser.add_argument("--api", default="async", choices=list(BACKENDS.keys()),
+                        help="cuFile API to use (default: async)")
+    parser.add_argument("--tokens", type=int, default=1024,
+                        help="Number of tokens per I/O operation")
+    parser.add_argument("--writes", type=int, default=1,
+                        help="Number of write operations to issue")
+    parser.add_argument("--reads", type=int, default=1,
+                        help="Number of read operations to issue")
+    parser.add_argument("--dir", default=".",
+                        help="Directory for test files (must support O_DIRECT)")
+    return parser.parse_args()
+
+
+def run_benchmark(args, backend):
+    single_token_kv_size = 131072
+    io_size = args.tokens * single_token_kv_size
     aligned_size = ((io_size + 4095) // 4096) * 4096
 
-    print(f"API:        cuFileReadAsync / cuFileWriteAsync")
+    print(f"API:        {backend.name}")
     print(f"Token size: {io_size} bytes (4 bytes/token x {args.tokens} tokens)")
     print(f"Aligned IO: {aligned_size} bytes")
     print(f"Writes:     {args.writes}")
@@ -126,108 +227,54 @@ def run_async(args):
     err = libcufile.cuFileBufRegister(buf_ptr, aligned_size, 0)
     assert err.err == CU_FILE_SUCCESS, f"cuFileBufRegister write failed: {err.err}"
 
-    # --- Writes (each to a separate file, each with its own stream) ---
+    # --- Writes ---
     write_files = [os.path.join(args.dir, f"gds_bench_{i}.bin") for i in range(args.writes)]
-
-    write_fds = []
-    write_handles = []
-    write_streams = []
-    for filepath in write_files:
-        fd = os.open(filepath, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
-        handle = register_handle(fd)
-        s = torch.cuda.Stream()
-        err = libcufile.cuFileStreamRegister(s.cuda_stream, 0)
-        assert err.err == CU_FILE_SUCCESS, f"cuFileStreamRegister failed: {err.err}"
-        write_fds.append(fd)
-        write_handles.append(handle)
-        write_streams.append(s)
+    write_ctxs = [backend.open_file(f, os.O_CREAT | os.O_WRONLY | os.O_DIRECT) for f in write_files]
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    for i in range(args.writes):
-        size_val = ctypes.c_size_t(aligned_size)
-        buf_offset = ctypes.c_ssize_t(0)
-        file_offset = ctypes.c_ssize_t(0)
-        bytes_done = ctypes.c_ssize_t(0)
-        err = libcufile.cuFileWriteAsync(
-            write_handles[i], buf_ptr,
-            ctypes.byref(size_val),
-            ctypes.byref(file_offset),
-            ctypes.byref(buf_offset),
-            ctypes.byref(bytes_done),
-            write_streams[i].cuda_stream,
-        )
-        assert err.err == CU_FILE_SUCCESS, f"cuFileWriteAsync #{i} failed: {err.err}"
+    for ctx in write_ctxs:
+        backend.write(ctx, buf_ptr, aligned_size)
+    backend.wait(write_ctxs)
 
-    for s in write_streams:
-        s.synchronize()
     t1 = time.perf_counter()
 
-    for i in range(args.writes):
-        libcufile.cuFileStreamDeregister(write_streams[i].cuda_stream)
-        libcufile.cuFileHandleDeregister(write_handles[i])
-        os.close(write_fds[i])
+    for ctx in write_ctxs:
+        backend.close(ctx)
 
     elapsed_ms = (t1 - t0) * 1000
     total_bytes = aligned_size * args.writes
     throughput_gibs = (total_bytes / (1 << 30)) / (t1 - t0) if t1 > t0 else 0
     print(f"Writes complete: {args.writes} ops, {elapsed_ms:.2f} ms, {throughput_gibs:.3f} GiB/s")
 
-    # --- Reads (each from a separate file, each with its own stream) ---
+    # --- Reads ---
     read_buf = torch.zeros(aligned_size, dtype=torch.uint8, device="cuda")
     read_ptr = read_buf.data_ptr()
     err = libcufile.cuFileBufRegister(read_ptr, aligned_size, 0)
     assert err.err == CU_FILE_SUCCESS, f"cuFileBufRegister read failed: {err.err}"
 
     read_files = [os.path.join(args.dir, f"gds_bench_{i}.bin") for i in range(args.reads)]
-
-    read_fds = []
-    read_handles = []
-    read_streams = []
-    for filepath in read_files:
-        fd = os.open(filepath, os.O_RDONLY | os.O_DIRECT)
-        handle = register_handle(fd)
-        s = torch.cuda.Stream()
-        err = libcufile.cuFileStreamRegister(s.cuda_stream, 0)
-        assert err.err == CU_FILE_SUCCESS, f"cuFileStreamRegister failed: {err.err}"
-        read_fds.append(fd)
-        read_handles.append(handle)
-        read_streams.append(s)
+    read_ctxs = [backend.open_file(f, os.O_RDONLY | os.O_DIRECT) for f in read_files]
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    for i in range(args.reads):
-        size_val = ctypes.c_size_t(aligned_size)
-        buf_offset = ctypes.c_ssize_t(0)
-        file_offset = ctypes.c_ssize_t(0)
-        bytes_done = ctypes.c_ssize_t(0)
-        err = libcufile.cuFileReadAsync(
-            read_handles[i], read_ptr,
-            ctypes.byref(size_val),
-            ctypes.byref(file_offset),
-            ctypes.byref(buf_offset),
-            ctypes.byref(bytes_done),
-            read_streams[i].cuda_stream,
-        )
-        assert err.err == CU_FILE_SUCCESS, f"cuFileReadAsync #{i} failed: {err.err}"
+    for ctx in read_ctxs:
+        backend.read(ctx, read_ptr, aligned_size)
+    backend.wait(read_ctxs)
 
-    for s in read_streams:
-        s.synchronize()
     t1 = time.perf_counter()
 
-    for i in range(args.reads):
-        libcufile.cuFileStreamDeregister(read_streams[i].cuda_stream)
-        libcufile.cuFileHandleDeregister(read_handles[i])
-        os.close(read_fds[i])
+    for ctx in read_ctxs:
+        backend.close(ctx)
 
     elapsed_ms = (t1 - t0) * 1000
     total_bytes = aligned_size * args.reads
     throughput_gibs = (total_bytes / (1 << 30)) / (t1 - t0) if t1 > t0 else 0
     print(f"Reads complete:  {args.reads} ops, {elapsed_ms:.2f} ms, {throughput_gibs:.3f} GiB/s")
 
-    # Verify last read
+    # Verify
     if torch.all(read_buf == 0xAB).item():
         print("\nVerification: PASS")
     else:
@@ -243,12 +290,14 @@ def run_async(args):
         os.unlink(filepath)
     print("Done. Test files removed.")
 
+
 def main():
     args = parse_args()
     print(f"PyTorch:    {torch.__version__}")
     print(f"CUDA:       {torch.version.cuda}")
     print(f"Device:     {torch.cuda.get_device_name(0)}")
-    run_async(args)    
+    run_benchmark(args, BACKENDS[args.api]())
+
 
 if __name__ == "__main__":
     main()
