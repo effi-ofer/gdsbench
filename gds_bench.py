@@ -98,6 +98,72 @@ libcufile.cuFileWrite.argtypes = [
     ctypes.c_long,      # buf_offset (off_t)
 ]
 
+# --- cuFile Batch IO structures ---
+
+CUFILE_READ = 0
+CUFILE_WRITE = 1
+
+class _BatchParams(ctypes.Structure):
+    _fields_ = [
+        ("devPtr_base", ctypes.c_void_p),
+        ("file_offset", ctypes.c_long),   # off_t
+        ("devPtr_offset", ctypes.c_long),  # off_t
+        ("size", ctypes.c_size_t),
+    ]
+
+class _BatchUnion(ctypes.Union):
+    _fields_ = [("batch", _BatchParams)]
+
+class CUfileIOParams_t(ctypes.Structure):
+    _fields_ = [
+        ("mode", ctypes.c_uint),       # CUfileBatchMode_t
+        ("u", _BatchUnion),
+        ("fh", CUfileHandle_t),
+        ("opcode", ctypes.c_uint),     # CUfileOpcode_t
+        ("cookie", ctypes.c_void_p),
+    ]
+
+class CUfileIOEvents_t(ctypes.Structure):
+    _fields_ = [
+        ("cookie", ctypes.c_void_p),
+        ("status", ctypes.c_uint),     # CUfileStatus_t
+        ("ret", ctypes.c_size_t),
+    ]
+
+CUfileBatchHandle_t = ctypes.c_void_p
+
+class Timespec(ctypes.Structure):
+    _fields_ = [
+        ("tv_sec", ctypes.c_long),
+        ("tv_nsec", ctypes.c_long),
+    ]
+
+libcufile.cuFileBatchIOSetUp.restype = CUfileError_t
+libcufile.cuFileBatchIOSetUp.argtypes = [
+    ctypes.POINTER(CUfileBatchHandle_t),
+    ctypes.c_uint,
+]
+
+libcufile.cuFileBatchIOSubmit.restype = CUfileError_t
+libcufile.cuFileBatchIOSubmit.argtypes = [
+    CUfileBatchHandle_t,
+    ctypes.c_uint,
+    ctypes.POINTER(CUfileIOParams_t),
+    ctypes.c_uint,
+]
+
+libcufile.cuFileBatchIOGetStatus.restype = CUfileError_t
+libcufile.cuFileBatchIOGetStatus.argtypes = [
+    CUfileBatchHandle_t,
+    ctypes.c_uint,                        # min_nr
+    ctypes.POINTER(ctypes.c_uint),        # nr (out)
+    ctypes.POINTER(CUfileIOEvents_t),
+    ctypes.POINTER(Timespec),
+]
+
+libcufile.cuFileBatchIODestroy.restype = None
+libcufile.cuFileBatchIODestroy.argtypes = [CUfileBatchHandle_t]
+
 # --- Backends ---
 
 def _register_handle(fd):
@@ -119,10 +185,10 @@ class SyncBackend:
         handle = _register_handle(fd)
         return {"fd": fd, "handle": handle}
 
-    def write_all(self, ctxs, buf_ptr, size):
+    def write_all(self, ctxs, size):
         def _write(ctx):
             torch.cuda.set_device(0)
-            ret = libcufile.cuFileWrite(ctx["handle"], buf_ptr, size, 0, 0)
+            ret = libcufile.cuFileWrite(ctx["handle"], ctx["buf_ptr"], size, 0, 0)
             assert ret >= 0, f"cuFileWrite failed with error: {ret}"
             assert ret == size, f"cuFileWrite short write: {ret}/{size}"
         threads = [threading.Thread(target=_write, args=(ctx,)) for ctx in ctxs]
@@ -131,10 +197,10 @@ class SyncBackend:
         for t in threads:
             t.join()
 
-    def read_all(self, ctxs, buf_ptr, size):
+    def read_all(self, ctxs, size):
         def _read(ctx):
             torch.cuda.set_device(0)
-            ret = libcufile.cuFileRead(ctx["handle"], buf_ptr, size, 0, 0)
+            ret = libcufile.cuFileRead(ctx["handle"], ctx["buf_ptr"], size, 0, 0)
             assert ret >= 0, f"cuFileRead failed with error: {ret}"
             assert ret == size, f"cuFileRead short read: {ret}/{size}"
         threads = [threading.Thread(target=_read, args=(ctx,)) for ctx in ctxs]
@@ -150,60 +216,136 @@ class SyncBackend:
 
 class AsyncBackend:
     name = "cuFileReadAsync / cuFileWriteAsync"
+    NUM_STREAMS = 64
+
+    def __init__(self):
+        self._streams = []
+        for _ in range(self.NUM_STREAMS):
+            s = torch.cuda.Stream()
+            err = libcufile.cuFileStreamRegister(s.cuda_stream, 0)
+            assert err.err == CU_FILE_SUCCESS, f"cuFileStreamRegister failed: {err.err}"
+            self._streams.append(s)
+        self._next = 0
+
+    def _get_stream(self):
+        s = self._streams[self._next % self.NUM_STREAMS]
+        self._next += 1
+        return s
 
     def open_file(self, filepath, flags, mode=0o644):
         fd = os.open(filepath, flags, mode)
         handle = _register_handle(fd)
-        stream = torch.cuda.Stream()
-        err = libcufile.cuFileStreamRegister(stream.cuda_stream, 0)
-        assert err.err == CU_FILE_SUCCESS, f"cuFileStreamRegister failed: {err.err}"
-        return {"fd": fd, "handle": handle, "stream": stream}
+        return {"fd": fd, "handle": handle}
 
-    def write_all(self, ctxs, buf_ptr, size):
+    def write_all(self, ctxs, size):
         for ctx in ctxs:
+            stream = self._get_stream()
             size_val = ctypes.c_size_t(size)
             file_offset = ctypes.c_ssize_t(0)
             buf_offset = ctypes.c_ssize_t(0)
             bytes_done = ctypes.c_ssize_t(0)
             ctx["_params"] = (size_val, file_offset, buf_offset, bytes_done)
             err = libcufile.cuFileWriteAsync(
-                ctx["handle"], buf_ptr,
+                ctx["handle"], ctx["buf_ptr"],
                 ctypes.byref(size_val),
                 ctypes.byref(file_offset),
                 ctypes.byref(buf_offset),
                 ctypes.byref(bytes_done),
-                ctx["stream"].cuda_stream,
+                stream.cuda_stream,
             )
             assert err.err == CU_FILE_SUCCESS, f"cuFileWriteAsync failed: {err.err}"
-        for ctx in ctxs:
-            ctx["stream"].synchronize()
+        for s in self._streams:
+            s.synchronize()
 
-    def read_all(self, ctxs, buf_ptr, size):
+    def read_all(self, ctxs, size):
         for ctx in ctxs:
+            stream = self._get_stream()
             size_val = ctypes.c_size_t(size)
             file_offset = ctypes.c_ssize_t(0)
             buf_offset = ctypes.c_ssize_t(0)
             bytes_done = ctypes.c_ssize_t(0)
             ctx["_params"] = (size_val, file_offset, buf_offset, bytes_done)
             err = libcufile.cuFileReadAsync(
-                ctx["handle"], buf_ptr,
+                ctx["handle"], ctx["buf_ptr"],
                 ctypes.byref(size_val),
                 ctypes.byref(file_offset),
                 ctypes.byref(buf_offset),
                 ctypes.byref(bytes_done),
-                ctx["stream"].cuda_stream,
+                stream.cuda_stream,
             )
             assert err.err == CU_FILE_SUCCESS, f"cuFileReadAsync failed: {err.err}"
-        for ctx in ctxs:
-            ctx["stream"].synchronize()
+        for s in self._streams:
+            s.synchronize()
 
     def close(self, ctx):
-        libcufile.cuFileStreamDeregister(ctx["stream"].cuda_stream)
         libcufile.cuFileHandleDeregister(ctx["handle"])
         os.close(ctx["fd"])
 
 
-BACKENDS = {"async": AsyncBackend, "cufile": SyncBackend}
+class BatchBackend:
+    name = "cuFileBatchIO"
+
+    def open_file(self, filepath, flags, mode=0o644):
+        fd = os.open(filepath, flags, mode)
+        handle = _register_handle(fd)
+        return {"fd": fd, "handle": handle}
+
+    def write_all(self, ctxs, size):
+        self._batch_io(ctxs, size, opcode=1)  # CUFILE_WRITE
+
+    def read_all(self, ctxs, size):
+        self._batch_io(ctxs, size, opcode=0)  # CUFILE_READ
+
+    def _batch_io(self, ctxs, size, opcode):
+        nr = len(ctxs)
+        IOParams = CUfileIOParams_t * nr
+        params = IOParams()
+        for i, ctx in enumerate(ctxs):
+            params[i].mode = 1  # CUFILE_BATCH
+            params[i].fh = ctx["handle"]
+            params[i].opcode = opcode
+            params[i].cookie = None
+            params[i].u.batch.devPtr_base = ctx["buf_ptr"]
+            params[i].u.batch.file_offset = 0
+            params[i].u.batch.devPtr_offset = 0
+            params[i].u.batch.size = size
+
+        batch_handle = CUfileBatchHandle_t()
+        err = libcufile.cuFileBatchIOSetUp(ctypes.byref(batch_handle), nr)
+        assert err.err == CU_FILE_SUCCESS, f"cuFileBatchIOSetUp failed: {err.err}"
+
+        err = libcufile.cuFileBatchIOSubmit(
+            batch_handle, nr, params, 0
+        )
+        assert err.err == CU_FILE_SUCCESS, f"cuFileBatchIOSubmit failed: {err.err}"
+
+        # Poll for completion
+        events = (CUfileIOEvents_t * nr)()
+        completed = ctypes.c_uint(0)
+        timeout = Timespec()
+        timeout.tv_sec = 10
+        timeout.tv_nsec = 0
+        err = libcufile.cuFileBatchIOGetStatus(
+            batch_handle, nr, ctypes.byref(completed),
+            events, ctypes.byref(timeout),
+        )
+        assert err.err == CU_FILE_SUCCESS, f"cuFileBatchIOGetStatus failed: {err.err}"
+        assert completed.value == nr, f"batch incomplete: {completed.value}/{nr}"
+
+        CUFILE_COMPLETE = 0x10
+        for i in range(nr):
+            assert events[i].status == CUFILE_COMPLETE, (
+                f"IO {i} status=0x{events[i].status:x} ret={events[i].ret}"
+            )
+
+        libcufile.cuFileBatchIODestroy(batch_handle)
+
+    def close(self, ctx):
+        libcufile.cuFileHandleDeregister(ctx["handle"])
+        os.close(ctx["fd"])
+
+
+BACKENDS = {"async": AsyncBackend, "cufile": SyncBackend, "batch": BatchBackend}
 
 # --- Benchmark harness ---
 
@@ -238,19 +380,23 @@ def run_benchmark(args, backend):
     err = libcufile.cuFileDriverOpen()
     assert err.err == CU_FILE_SUCCESS, f"cuFileDriverOpen failed: {err.err}"
 
-    write_buf = torch.full((aligned_size,), 0xAB, dtype=torch.uint8, device="cuda")
-    buf_ptr = write_buf.data_ptr()
-    err = libcufile.cuFileBufRegister(buf_ptr, aligned_size, 0)
-    assert err.err == CU_FILE_SUCCESS, f"cuFileBufRegister write failed: {err.err}"
-
     # --- Writes ---
+    write_bufs = []
+    for i in range(args.writes):
+        buf = torch.full((aligned_size,), 0xAB, dtype=torch.uint8, device="cuda")
+        err = libcufile.cuFileBufRegister(buf.data_ptr(), aligned_size, 0)
+        assert err.err == CU_FILE_SUCCESS, f"cuFileBufRegister write[{i}] failed: {err.err}"
+        write_bufs.append(buf)
+
     write_files = [os.path.join(args.dir, f"gds_bench_{i}.bin") for i in range(args.writes)]
     write_ctxs = [backend.open_file(f, os.O_CREAT | os.O_WRONLY | os.O_DIRECT) for f in write_files]
+    for ctx, buf in zip(write_ctxs, write_bufs):
+        ctx["buf_ptr"] = buf.data_ptr()
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    backend.write_all(write_ctxs, buf_ptr, aligned_size)
+    backend.write_all(write_ctxs, aligned_size)
 
     t1 = time.perf_counter()
 
@@ -263,18 +409,22 @@ def run_benchmark(args, backend):
     print(f"Writes complete: {args.writes} ops, {elapsed_ms:.2f} ms, {throughput_gibs:.3f} GiB/s")
 
     # --- Reads ---
-    read_buf = torch.zeros(aligned_size, dtype=torch.uint8, device="cuda")
-    read_ptr = read_buf.data_ptr()
-    err = libcufile.cuFileBufRegister(read_ptr, aligned_size, 0)
-    assert err.err == CU_FILE_SUCCESS, f"cuFileBufRegister read failed: {err.err}"
+    read_bufs = []
+    for i in range(args.reads):
+        buf = torch.zeros(aligned_size, dtype=torch.uint8, device="cuda")
+        err = libcufile.cuFileBufRegister(buf.data_ptr(), aligned_size, 0)
+        assert err.err == CU_FILE_SUCCESS, f"cuFileBufRegister read[{i}] failed: {err.err}"
+        read_bufs.append(buf)
 
     read_files = [os.path.join(args.dir, f"gds_bench_{i}.bin") for i in range(args.reads)]
     read_ctxs = [backend.open_file(f, os.O_RDONLY | os.O_DIRECT) for f in read_files]
+    for ctx, buf in zip(read_ctxs, read_bufs):
+        ctx["buf_ptr"] = buf.data_ptr()
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    backend.read_all(read_ctxs, read_ptr, aligned_size)
+    backend.read_all(read_ctxs, aligned_size)
 
     t1 = time.perf_counter()
 
@@ -287,16 +437,19 @@ def run_benchmark(args, backend):
     print(f"Reads complete:  {args.reads} ops, {elapsed_ms:.2f} ms, {throughput_gibs:.3f} GiB/s")
 
     # Verify
-    if torch.all(read_buf == 0xAB).item():
+    all_pass = all(torch.all(buf == 0xAB).item() for buf in read_bufs)
+    if all_pass:
         print("\nVerification: PASS")
     else:
         print("\nVerification: FAIL")
 
     # Cleanup
-    err = libcufile.cuFileBufDeregister(read_ptr)
-    assert err.err == CU_FILE_SUCCESS, f"cuFileBufDeregister read failed: {err.err}"
-    err = libcufile.cuFileBufDeregister(buf_ptr)
-    assert err.err == CU_FILE_SUCCESS, f"cuFileBufDeregister write failed: {err.err}"
+    for buf in read_bufs:
+        err = libcufile.cuFileBufDeregister(buf.data_ptr())
+        assert err.err == CU_FILE_SUCCESS, f"cuFileBufDeregister read failed: {err.err}"
+    for buf in write_bufs:
+        err = libcufile.cuFileBufDeregister(buf.data_ptr())
+        assert err.err == CU_FILE_SUCCESS, f"cuFileBufDeregister write failed: {err.err}"
     libcufile.cuFileDriverClose()
     for filepath in write_files:
         os.unlink(filepath)
