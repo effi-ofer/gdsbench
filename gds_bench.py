@@ -119,18 +119,29 @@ class SyncBackend:
         handle = _register_handle(fd)
         return {"fd": fd, "handle": handle}
 
-    def write(self, ctx, buf_ptr, size):
-        ret = libcufile.cuFileWrite(ctx["handle"], buf_ptr, size, 0, 0)
-        assert ret >= 0, f"cuFileWrite failed with error: {ret}"
-        assert ret == size, f"cuFileWrite short write: {ret}/{size}"
+    def write_all(self, ctxs, buf_ptr, size):
+        def _write(ctx):
+            torch.cuda.set_device(0)
+            ret = libcufile.cuFileWrite(ctx["handle"], buf_ptr, size, 0, 0)
+            assert ret >= 0, f"cuFileWrite failed with error: {ret}"
+            assert ret == size, f"cuFileWrite short write: {ret}/{size}"
+        threads = [threading.Thread(target=_write, args=(ctx,)) for ctx in ctxs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
-    def read(self, ctx, buf_ptr, size):
-        ret = libcufile.cuFileRead(ctx["handle"], buf_ptr, size, 0, 0)
-        assert ret >= 0, f"cuFileRead failed with error: {ret}"
-        assert ret == size, f"cuFileRead short read: {ret}/{size}"
-
-    def wait(self, ctxs):
-        pass
+    def read_all(self, ctxs, buf_ptr, size):
+        def _read(ctx):
+            torch.cuda.set_device(0)
+            ret = libcufile.cuFileRead(ctx["handle"], buf_ptr, size, 0, 0)
+            assert ret >= 0, f"cuFileRead failed with error: {ret}"
+            assert ret == size, f"cuFileRead short read: {ret}/{size}"
+        threads = [threading.Thread(target=_read, args=(ctx,)) for ctx in ctxs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
     def close(self, ctx):
         libcufile.cuFileHandleDeregister(ctx["handle"])
@@ -148,39 +159,41 @@ class AsyncBackend:
         assert err.err == CU_FILE_SUCCESS, f"cuFileStreamRegister failed: {err.err}"
         return {"fd": fd, "handle": handle, "stream": stream}
 
-    def write(self, ctx, buf_ptr, size):
-        size_val = ctypes.c_size_t(size)
-        file_offset = ctypes.c_ssize_t(0)
-        buf_offset = ctypes.c_ssize_t(0)
-        bytes_done = ctypes.c_ssize_t(0)
-        ctx["_params"] = (size_val, file_offset, buf_offset, bytes_done)
-        err = libcufile.cuFileWriteAsync(
-            ctx["handle"], buf_ptr,
-            ctypes.byref(size_val),
-            ctypes.byref(file_offset),
-            ctypes.byref(buf_offset),
-            ctypes.byref(bytes_done),
-            ctx["stream"].cuda_stream,
-        )
-        assert err.err == CU_FILE_SUCCESS, f"cuFileWriteAsync failed: {err.err}"
+    def write_all(self, ctxs, buf_ptr, size):
+        for ctx in ctxs:
+            size_val = ctypes.c_size_t(size)
+            file_offset = ctypes.c_ssize_t(0)
+            buf_offset = ctypes.c_ssize_t(0)
+            bytes_done = ctypes.c_ssize_t(0)
+            ctx["_params"] = (size_val, file_offset, buf_offset, bytes_done)
+            err = libcufile.cuFileWriteAsync(
+                ctx["handle"], buf_ptr,
+                ctypes.byref(size_val),
+                ctypes.byref(file_offset),
+                ctypes.byref(buf_offset),
+                ctypes.byref(bytes_done),
+                ctx["stream"].cuda_stream,
+            )
+            assert err.err == CU_FILE_SUCCESS, f"cuFileWriteAsync failed: {err.err}"
+        for ctx in ctxs:
+            ctx["stream"].synchronize()
 
-    def read(self, ctx, buf_ptr, size):
-        size_val = ctypes.c_size_t(size)
-        file_offset = ctypes.c_ssize_t(0)
-        buf_offset = ctypes.c_ssize_t(0)
-        bytes_done = ctypes.c_ssize_t(0)
-        ctx["_params"] = (size_val, file_offset, buf_offset, bytes_done)
-        err = libcufile.cuFileReadAsync(
-            ctx["handle"], buf_ptr,
-            ctypes.byref(size_val),
-            ctypes.byref(file_offset),
-            ctypes.byref(buf_offset),
-            ctypes.byref(bytes_done),
-            ctx["stream"].cuda_stream,
-        )
-        assert err.err == CU_FILE_SUCCESS, f"cuFileReadAsync failed: {err.err}"
-
-    def wait(self, ctxs):
+    def read_all(self, ctxs, buf_ptr, size):
+        for ctx in ctxs:
+            size_val = ctypes.c_size_t(size)
+            file_offset = ctypes.c_ssize_t(0)
+            buf_offset = ctypes.c_ssize_t(0)
+            bytes_done = ctypes.c_ssize_t(0)
+            ctx["_params"] = (size_val, file_offset, buf_offset, bytes_done)
+            err = libcufile.cuFileReadAsync(
+                ctx["handle"], buf_ptr,
+                ctypes.byref(size_val),
+                ctypes.byref(file_offset),
+                ctypes.byref(buf_offset),
+                ctypes.byref(bytes_done),
+                ctx["stream"].cuda_stream,
+            )
+            assert err.err == CU_FILE_SUCCESS, f"cuFileReadAsync failed: {err.err}"
         for ctx in ctxs:
             ctx["stream"].synchronize()
 
@@ -237,20 +250,7 @@ def run_benchmark(args, backend):
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    if len(write_ctxs) > 1:
-        def _write(ctx):
-            torch.cuda.set_device(0)
-            backend.write(ctx, buf_ptr, aligned_size)
-        threads = [threading.Thread(target=_write, args=(ctx,))
-                   for ctx in write_ctxs]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-    else:
-        for ctx in write_ctxs:
-            backend.write(ctx, buf_ptr, aligned_size)
-    backend.wait(write_ctxs)
+    backend.write_all(write_ctxs, buf_ptr, aligned_size)
 
     t1 = time.perf_counter()
 
@@ -274,20 +274,7 @@ def run_benchmark(args, backend):
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    if len(read_ctxs) > 1:
-        def _read(ctx):
-            torch.cuda.set_device(0)
-            backend.read(ctx, read_ptr, aligned_size)
-        threads = [threading.Thread(target=_read, args=(ctx,))
-                   for ctx in read_ctxs]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-    else:
-        for ctx in read_ctxs:
-            backend.read(ctx, read_ptr, aligned_size)
-    backend.wait(read_ctxs)
+    backend.read_all(read_ctxs, read_ptr, aligned_size)
 
     t1 = time.perf_counter()
 
