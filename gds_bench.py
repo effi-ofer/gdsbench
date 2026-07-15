@@ -238,7 +238,10 @@ def run_benchmark(args, backend):
     t0 = time.perf_counter()
 
     if len(write_ctxs) > 1:
-        threads = [threading.Thread(target=backend.write, args=(ctx, buf_ptr, aligned_size))
+        def _write(ctx):
+            torch.cuda.set_device(0)
+            backend.write(ctx, buf_ptr, aligned_size)
+        threads = [threading.Thread(target=_write, args=(ctx,))
                    for ctx in write_ctxs]
         for t in threads:
             t.start()
@@ -272,7 +275,10 @@ def run_benchmark(args, backend):
     t0 = time.perf_counter()
 
     if len(read_ctxs) > 1:
-        threads = [threading.Thread(target=backend.read, args=(ctx, read_ptr, aligned_size))
+        def _read(ctx):
+            torch.cuda.set_device(0)
+            backend.read(ctx, read_ptr, aligned_size)
+        threads = [threading.Thread(target=_read, args=(ctx,))
                    for ctx in read_ctxs]
         for t in threads:
             t.start()
