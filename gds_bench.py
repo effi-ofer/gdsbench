@@ -11,25 +11,25 @@ import torch
 # --- cuFile ctypes bindings ---
 
 CU_FILE_SUCCESS = 0
-CU_FILE_HANDLE_TYPE_OPAQUE_FD = 0
+CU_FILE_HANDLE_TYPE_OPAQUE_FD = 1
 
 libcufile = ctypes.CDLL("libcufile.so", mode=ctypes.RTLD_GLOBAL)
 
 class CUfileError_t(ctypes.Structure):
     _fields_ = [("err", ctypes.c_int), ("cu_err", ctypes.c_int)]
 
-class CUfileHandle_t(ctypes.Structure):
-    _fields_ = [("handle", ctypes.c_void_p)]
+CUfileHandle_t = ctypes.c_void_p
 
-class CUfileDescrUnion(ctypes.Union):
-    _fields_ = [("fd", ctypes.c_int)]
+class _HandleUnion(ctypes.Union):
+    _fields_ = [("fd", ctypes.c_int), ("handle", ctypes.c_void_p)]
 
 class CUfileDescr_t(ctypes.Structure):
     _fields_ = [
-        ("type", ctypes.c_int),
-        ("handle", CUfileDescrUnion),
+        ("type", ctypes.c_uint),
+        ("handle", _HandleUnion),
         ("fs_ops", ctypes.c_void_p),
     ]
+
 libcufile.cuFileDriverOpen.restype = CUfileError_t
 libcufile.cuFileDriverOpen.argtypes = []
 
@@ -53,22 +53,24 @@ libcufile.cuFileBufDeregister.argtypes = [ctypes.c_void_p]
 
 libcufile.cuFileWriteAsync.restype = CUfileError_t
 libcufile.cuFileWriteAsync.argtypes = [
-    CUfileHandle_t,        # handle
-    ctypes.c_void_p,       # devPtr
-    ctypes.POINTER(ctypes.c_size_t),  # size
-    ctypes.POINTER(ctypes.c_int64),   # file_offset
-    ctypes.POINTER(ctypes.c_size_t),  # devPtr_offset
-    ctypes.c_void_p,       # stream
+    CUfileHandle_t,                      # handle
+    ctypes.c_void_p,                     # devPtr
+    ctypes.POINTER(ctypes.c_size_t),     # size_p
+    ctypes.POINTER(ctypes.c_ssize_t),    # file_offset_p
+    ctypes.POINTER(ctypes.c_ssize_t),    # buf_offset_p
+    ctypes.POINTER(ctypes.c_ssize_t),    # bytes_written_p
+    ctypes.c_void_p,                     # stream
 ]
 
 libcufile.cuFileReadAsync.restype = CUfileError_t
 libcufile.cuFileReadAsync.argtypes = [
-    CUfileHandle_t,        # handle
-    ctypes.c_void_p,       # devPtr
-    ctypes.POINTER(ctypes.c_size_t),  # size
-    ctypes.POINTER(ctypes.c_int64),   # file_offset
-    ctypes.POINTER(ctypes.c_size_t),  # devPtr_offset
-    ctypes.c_void_p,       # stream
+    CUfileHandle_t,                      # handle
+    ctypes.c_void_p,                     # devPtr
+    ctypes.POINTER(ctypes.c_size_t),     # size_p
+    ctypes.POINTER(ctypes.c_ssize_t),    # file_offset_p
+    ctypes.POINTER(ctypes.c_ssize_t),    # buf_offset_p
+    ctypes.POINTER(ctypes.c_ssize_t),    # bytes_read_p
+    ctypes.c_void_p,                     # stream
 ]
 
 # --- Benchmark logic ---
@@ -95,7 +97,7 @@ def register_handle(fd):
     handle = CUfileHandle_t()
     err = libcufile.cuFileHandleRegister(ctypes.byref(handle), ctypes.byref(descr))
     assert err.err == CU_FILE_SUCCESS, f"cuFileHandleRegister failed: {err.err}"
-    return handle
+    return handle.value
 
 def run_async(args):
     token_size = 4
@@ -121,8 +123,9 @@ def run_async(args):
     assert err.err == CU_FILE_SUCCESS, f"cuFileBufRegister write failed: {err.err}"
 
     size_val = ctypes.c_size_t(aligned_size)
-    dev_offset = ctypes.c_size_t(0)
-    file_offset = ctypes.c_int64(0)
+    buf_offset = ctypes.c_ssize_t(0)
+    file_offset = ctypes.c_ssize_t(0)
+    bytes_done = ctypes.c_ssize_t(0)
 
     # --- Writes (each to a separate file) ---
     write_files = [os.path.join(args.dir, f"gds_bench_{i}.bin") for i in range(args.writes)]
@@ -143,7 +146,8 @@ def run_async(args):
             write_handles[i], buf_ptr,
             ctypes.byref(size_val),
             ctypes.byref(file_offset),
-            ctypes.byref(dev_offset),
+            ctypes.byref(buf_offset),
+            ctypes.byref(bytes_done),
             stream.cuda_stream,
         )
         assert err.err == CU_FILE_SUCCESS, f"cuFileWriteAsync #{i} failed: {err.err}"
@@ -184,7 +188,8 @@ def run_async(args):
             read_handles[i], read_ptr,
             ctypes.byref(size_val),
             ctypes.byref(file_offset),
-            ctypes.byref(dev_offset),
+            ctypes.byref(buf_offset),
+            ctypes.byref(bytes_done),
             stream.cuda_stream,
         )
         assert err.err == CU_FILE_SUCCESS, f"cuFileReadAsync #{i} failed: {err.err}"
