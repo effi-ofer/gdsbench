@@ -152,6 +152,7 @@ class AsyncBackend:
         file_offset = ctypes.c_ssize_t(0)
         buf_offset = ctypes.c_ssize_t(0)
         bytes_done = ctypes.c_ssize_t(0)
+        ctx["_params"] = (size_val, file_offset, buf_offset, bytes_done)
         err = libcufile.cuFileWriteAsync(
             ctx["handle"], buf_ptr,
             ctypes.byref(size_val),
@@ -167,6 +168,7 @@ class AsyncBackend:
         file_offset = ctypes.c_ssize_t(0)
         buf_offset = ctypes.c_ssize_t(0)
         bytes_done = ctypes.c_ssize_t(0)
+        ctx["_params"] = (size_val, file_offset, buf_offset, bytes_done)
         err = libcufile.cuFileReadAsync(
             ctx["handle"], buf_ptr,
             ctypes.byref(size_val),
@@ -212,7 +214,7 @@ def run_benchmark(args, backend):
     aligned_size = ((io_size + 4095) // 4096) * 4096
 
     print(f"API:        {backend.name}")
-    print(f"Token size: {io_size} bytes (4 bytes/token x {args.tokens} tokens)")
+    print(f"Token size: {io_size} bytes (131072 bytes/token x {args.tokens} tokens)")
     print(f"Aligned IO: {aligned_size} bytes")
     print(f"Writes:     {args.writes}")
     print(f"Reads:      {args.reads}")
