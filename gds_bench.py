@@ -219,15 +219,21 @@ class AsyncBackend:
     NUM_STREAMS = 64
 
     def __init__(self):
+        self._streams = None
+        self._next = 0
+
+    def _ensure_streams(self):
+        if self._streams is not None:
+            return
         self._streams = []
         for _ in range(self.NUM_STREAMS):
             s = torch.cuda.Stream()
             err = libcufile.cuFileStreamRegister(s.cuda_stream, 0)
             assert err.err == CU_FILE_SUCCESS, f"cuFileStreamRegister failed: {err.err}"
             self._streams.append(s)
-        self._next = 0
 
     def _get_stream(self):
+        self._ensure_streams()
         s = self._streams[self._next % self.NUM_STREAMS]
         self._next += 1
         return s
