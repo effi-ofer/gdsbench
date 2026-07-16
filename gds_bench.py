@@ -306,16 +306,25 @@ class BatchBackend:
         nr = len(ctxs) * chunks_per_io
         IOParams = CUfileIOParams_t * nr
         params = IOParams()
+
+        # Register each chunk sub-pointer individually
+        chunk_ptrs = []
         idx = 0
         for ctx in ctxs:
             offset = 0
             for _ in range(chunks_per_io):
                 chunk_size = min(self.MAX_BATCH_ENTRY_SIZE, size - offset)
+                chunk_ptr = ctx["buf_ptr"] + offset
+                err = libcufile.cuFileBufRegister(chunk_ptr, chunk_size, 0)
+                assert err.err == CU_FILE_SUCCESS, (
+                    f"cuFileBufRegister chunk failed: {err.err}"
+                )
+                chunk_ptrs.append((chunk_ptr, chunk_size))
                 params[idx].mode = 1  # CUFILE_BATCH
                 params[idx].fh = ctx["handle"]
                 params[idx].opcode = opcode
                 params[idx].cookie = None
-                params[idx].u.batch.devPtr_base = ctx["buf_ptr"] + offset
+                params[idx].u.batch.devPtr_base = chunk_ptr
                 params[idx].u.batch.file_offset = offset
                 params[idx].u.batch.devPtr_offset = 0
                 params[idx].u.batch.size = chunk_size
@@ -333,16 +342,15 @@ class BatchBackend:
 
         # Poll for completion
         events = (CUfileIOEvents_t * nr)()
-        completed = ctypes.c_uint(0)
-        timeout = Timespec()
-        timeout.tv_sec = 10
-        timeout.tv_nsec = 0
-        err = libcufile.cuFileBatchIOGetStatus(
-            batch_handle, nr, ctypes.byref(completed),
-            events, ctypes.byref(timeout),
-        )
-        assert err.err == CU_FILE_SUCCESS, f"cuFileBatchIOGetStatus failed: {err.err}"
-        assert completed.value == nr, f"batch incomplete: {completed.value}/{nr}"
+        num_completed = 0
+        while num_completed < nr:
+            batch_nr = ctypes.c_uint(0)
+            err = libcufile.cuFileBatchIOGetStatus(
+                batch_handle, nr - num_completed, ctypes.byref(batch_nr),
+                events, None,
+            )
+            assert err.err == CU_FILE_SUCCESS, f"cuFileBatchIOGetStatus failed: {err.err}"
+            num_completed += batch_nr.value
 
         CUFILE_COMPLETE = 0x10
         for i in range(nr):
@@ -351,6 +359,10 @@ class BatchBackend:
             )
 
         libcufile.cuFileBatchIODestroy(batch_handle)
+
+        # Deregister chunk sub-pointers
+        for chunk_ptr, _ in chunk_ptrs:
+            libcufile.cuFileBufDeregister(chunk_ptr)
 
     def close(self, ctx):
         libcufile.cuFileHandleDeregister(ctx["handle"])
@@ -398,8 +410,9 @@ def run_benchmark(args, backend):
     write_bufs = []
     for i in range(args.writes):
         buf = torch.full((aligned_size,), 0xAB, dtype=torch.uint8, device="cuda")
-        err = libcufile.cuFileBufRegister(buf.data_ptr(), aligned_size, 0)
-        assert err.err == CU_FILE_SUCCESS, f"cuFileBufRegister write[{i}] failed: {err.err}"
+        if not isinstance(backend, BatchBackend):
+            err = libcufile.cuFileBufRegister(buf.data_ptr(), aligned_size, 0)
+            assert err.err == CU_FILE_SUCCESS, f"cuFileBufRegister write[{i}] failed: {err.err}"
         write_bufs.append(buf)
 
     write_files = [os.path.join(args.dir, f"gds_bench_{i}.bin") for i in range(args.writes)]
@@ -426,8 +439,9 @@ def run_benchmark(args, backend):
     read_bufs = []
     for i in range(args.reads):
         buf = torch.zeros(aligned_size, dtype=torch.uint8, device="cuda")
-        err = libcufile.cuFileBufRegister(buf.data_ptr(), aligned_size, 0)
-        assert err.err == CU_FILE_SUCCESS, f"cuFileBufRegister read[{i}] failed: {err.err}"
+        if not isinstance(backend, BatchBackend):
+            err = libcufile.cuFileBufRegister(buf.data_ptr(), aligned_size, 0)
+            assert err.err == CU_FILE_SUCCESS, f"cuFileBufRegister read[{i}] failed: {err.err}"
         read_bufs.append(buf)
 
     read_files = [os.path.join(args.dir, f"gds_bench_{i}.bin") for i in range(args.reads)]
@@ -469,12 +483,13 @@ def run_benchmark(args, backend):
             print("\nVerification: FAIL")
 
     # Cleanup
-    for buf in read_bufs:
-        err = libcufile.cuFileBufDeregister(buf.data_ptr())
-        assert err.err == CU_FILE_SUCCESS, f"cuFileBufDeregister read failed: {err.err}"
-    for buf in write_bufs:
-        err = libcufile.cuFileBufDeregister(buf.data_ptr())
-        assert err.err == CU_FILE_SUCCESS, f"cuFileBufDeregister write failed: {err.err}"
+    if not isinstance(backend, BatchBackend):
+        for buf in read_bufs:
+            err = libcufile.cuFileBufDeregister(buf.data_ptr())
+            assert err.err == CU_FILE_SUCCESS, f"cuFileBufDeregister read failed: {err.err}"
+        for buf in write_bufs:
+            err = libcufile.cuFileBufDeregister(buf.data_ptr())
+            assert err.err == CU_FILE_SUCCESS, f"cuFileBufDeregister write failed: {err.err}"
     libcufile.cuFileDriverClose()
     for filepath in write_files:
         os.unlink(filepath)
