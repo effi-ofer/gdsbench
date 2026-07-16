@@ -315,9 +315,9 @@ class BatchBackend:
                 params[idx].fh = ctx["handle"]
                 params[idx].opcode = opcode
                 params[idx].cookie = None
-                params[idx].u.batch.devPtr_base = ctx["buf_ptr"]
+                params[idx].u.batch.devPtr_base = ctx["buf_ptr"] + offset
                 params[idx].u.batch.file_offset = offset
-                params[idx].u.batch.devPtr_offset = offset
+                params[idx].u.batch.devPtr_offset = 0
                 params[idx].u.batch.size = chunk_size
                 offset += chunk_size
                 idx += 1
