@@ -238,6 +238,7 @@ class AsyncBackend:
         return {"fd": fd, "handle": handle}
 
     def write_all(self, ctxs, size):
+        self._next = 0
         for ctx in ctxs:
             stream = self._get_stream()
             size_val = ctypes.c_size_t(size)
@@ -258,6 +259,7 @@ class AsyncBackend:
             s.synchronize()
 
     def read_all(self, ctxs, size):
+        self._next = 0
         for ctx in ctxs:
             stream = self._get_stream()
             size_val = ctypes.c_size_t(size)
@@ -361,6 +363,8 @@ def parse_args():
                         help="Number of read operations to issue")
     parser.add_argument("--dir", default=".",
                         help="Directory for test files (must support O_DIRECT)")
+    parser.add_argument("--verify", action="store_true",
+                        help="Compare each read buffer to its corresponding write buffer")
     return parser.parse_args()
 
 
@@ -437,11 +441,22 @@ def run_benchmark(args, backend):
     print(f"Reads complete:  {args.reads} ops, {elapsed_ms:.2f} ms, {throughput_gibs:.3f} GiB/s")
 
     # Verify
-    all_pass = all(torch.all(buf == 0xAB).item() for buf in read_bufs)
-    if all_pass:
-        print("\nVerification: PASS")
+    if args.verify:
+        num_compare = min(args.writes, args.reads)
+        all_pass = True
+        for i in range(num_compare):
+            if not torch.equal(read_bufs[i], write_bufs[i]):
+                all_pass = False
+                print(f"\nVerification: FAIL (buffer {i} mismatch)")
+                break
+        if all_pass:
+            print(f"\nVerification: PASS ({num_compare} buffers match)")
     else:
-        print("\nVerification: FAIL")
+        all_pass = all(torch.all(buf == 0xAB).item() for buf in read_bufs)
+        if all_pass:
+            print("\nVerification: PASS")
+        else:
+            print("\nVerification: FAIL")
 
     # Cleanup
     for buf in read_bufs:
