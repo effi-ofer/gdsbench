@@ -217,7 +217,7 @@ class SyncBackend:
 class AsyncBackend:
     name = "cuFileReadAsync / cuFileWriteAsync"
 
-    NUM_STREAMS = 64
+    NUM_STREAMS = 32
 
     def __init__(self):
         self._streams = []
@@ -299,19 +299,28 @@ class BatchBackend:
     def read_all(self, ctxs, size):
         self._batch_io(ctxs, size, opcode=0)  # CUFILE_READ
 
+    MAX_BATCH_ENTRY_SIZE = 983040
+
     def _batch_io(self, ctxs, size, opcode):
-        nr = len(ctxs)
+        chunks_per_io = (size + self.MAX_BATCH_ENTRY_SIZE - 1) // self.MAX_BATCH_ENTRY_SIZE
+        nr = len(ctxs) * chunks_per_io
         IOParams = CUfileIOParams_t * nr
         params = IOParams()
-        for i, ctx in enumerate(ctxs):
-            params[i].mode = 1  # CUFILE_BATCH
-            params[i].fh = ctx["handle"]
-            params[i].opcode = opcode
-            params[i].cookie = None
-            params[i].u.batch.devPtr_base = ctx["buf_ptr"]
-            params[i].u.batch.file_offset = 0
-            params[i].u.batch.devPtr_offset = 0
-            params[i].u.batch.size = size
+        idx = 0
+        for ctx in ctxs:
+            offset = 0
+            for _ in range(chunks_per_io):
+                chunk_size = min(self.MAX_BATCH_ENTRY_SIZE, size - offset)
+                params[idx].mode = 1  # CUFILE_BATCH
+                params[idx].fh = ctx["handle"]
+                params[idx].opcode = opcode
+                params[idx].cookie = None
+                params[idx].u.batch.devPtr_base = ctx["buf_ptr"]
+                params[idx].u.batch.file_offset = offset
+                params[idx].u.batch.devPtr_offset = offset
+                params[idx].u.batch.size = chunk_size
+                offset += chunk_size
+                idx += 1
 
         batch_handle = CUfileBatchHandle_t()
         err = libcufile.cuFileBatchIOSetUp(ctypes.byref(batch_handle), nr)
