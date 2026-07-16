@@ -217,19 +217,20 @@ class SyncBackend:
 class AsyncBackend:
     name = "cuFileReadAsync / cuFileWriteAsync"
 
+    NUM_STREAMS = 64
+
     def __init__(self):
         self._streams = []
+        for _ in range(self.NUM_STREAMS):
+            s = torch.cuda.Stream()
+            err = libcufile.cuFileStreamRegister(s.cuda_stream, 0)
+            assert err.err == CU_FILE_SUCCESS, f"cuFileStreamRegister failed: {err.err}"
+            self._streams.append(s)
         self._next = 0
 
     def _get_stream(self):
-        idx = self._next
+        s = self._streams[self._next % self.NUM_STREAMS]
         self._next += 1
-        if idx < len(self._streams):
-            return self._streams[idx]
-        s = torch.cuda.Stream()
-        err = libcufile.cuFileStreamRegister(s.cuda_stream, 0)
-        assert err.err == CU_FILE_SUCCESS, f"cuFileStreamRegister failed: {err.err}"
-        self._streams.append(s)
         return s
 
     def open_file(self, filepath, flags, mode=0o644):
